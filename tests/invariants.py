@@ -752,10 +752,11 @@ def check_root():
         mounts_after = Path("/proc/self/mountinfo").read_text()
         if mounts_after != mounts_before:
             fail("root inject leaked a mount into the caller's mount namespace")
-        for p in pids:
-            exe = read_exe(p, root=True)
-            if not exe or Path(exe).resolve() == BIN.resolve():
-                fail(f"root exe spoof did not run for pid {p}")
+        if exe_known():
+            for p in pids:
+                exe = read_exe(p, root=True)
+                if not exe or Path(exe).resolve() == BIN.resolve():
+                    fail(f"root exe spoof did not run for pid {p}")
         stop_pidfile(pidfile, root=True)
 
         has_www = subprocess.run(["getent", "passwd", "www-data"],
@@ -766,8 +767,16 @@ def check_root():
             tmp, 12, root=True)
         time.sleep(0.4)
         rows = ps_rows()
-        workers = [p for p in pids if rows.get(p) and rows[p]["cmd"].startswith(
-            ("apache2 -k start", "php-fpm: pool", "nginx: worker"))]
+        # Under qemu-user the row starts with the emulator; match the template
+        # anywhere it appears.
+        def is_worker(cmd):
+            if emulated():
+                return any(k in cmd for k in
+                           ("apache2 -k start", "php-fpm: pool", "nginx: worker"))
+            return cmd.startswith(("apache2 -k start", "php-fpm: pool",
+                                   "nginx: worker"))
+
+        workers = [p for p in pids if rows.get(p) and is_worker(rows[p]["cmd"])]
         if not workers:
             fail("root run produced no service workers")
         if has_www:
@@ -775,13 +784,15 @@ def check_root():
                 if rows[p]["user"] != "www-data":
                     fail(f"worker {p} runs as {rows[p]['user']}, not www-data")
             for p in pids:
-                if rows.get(p) and rows[p]["cmd"].startswith(("apache2 -DFOREGROUND",
-                                                              "php-fpm: master")):
-                    if rows[p]["user"] != "root":
-                        fail(f"master {p} runs as {rows[p]['user']}, not root")
-        for p in pids:
-            if Path(read_exe(p, root=True)).resolve() != BIN.resolve():
-                fail(f"root --no-exe pid {p} exe is not psgen")
+                cmd = rows[p]["cmd"] if rows.get(p) else ""
+                master = ("apache2 -DFOREGROUND" in cmd or "php-fpm: master" in cmd)                     if emulated() else cmd.startswith(("apache2 -DFOREGROUND",
+                                                       "php-fpm: master"))
+                if master and rows[p]["user"] != "root":
+                    fail(f"master {p} runs as {rows[p]['user']}, not root")
+        if exe_known():
+            for p in pids:
+                if Path(read_exe(p, root=True)).resolve() != BIN.resolve():
+                    fail(f"root --no-exe pid {p} exe is not psgen")
         stop_pidfile(pidfile, root=True)
 
         before = subprocess.run(["getent", "passwd", "haproxy"],
@@ -809,10 +820,11 @@ def check_root():
             ["inject", "--elevate", "-n", "2", "--no-user", "--no-exe",
              "--no-mem", "--no-tty", "--no-threads"], tmp, 2,
             root=False, read_root=True)
-        for p in pids:
-            exe = read_exe(p, root=True)
-            if exe and Path(exe).resolve() != BIN.resolve():
-                fail(f"--elevate pid {p} exe is not psgen")
+        if exe_known():
+            for p in pids:
+                exe = read_exe(p, root=True)
+                if exe and Path(exe).resolve() != BIN.resolve():
+                    fail(f"--elevate pid {p} exe is not psgen")
 
         p = run(["inject", "--elevate", "-n", "1", "--pidfile", "/proc/1/foo"],
                 check=False)
